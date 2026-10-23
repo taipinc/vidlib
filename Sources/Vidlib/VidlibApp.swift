@@ -24,7 +24,7 @@ struct VidlibApp: App {
           "l", modifiers: [.command, .shift])
       }
     }
-    Settings { CacheSettingsView().environmentObject(library) }
+    Settings { AppSettingsView().environmentObject(library) }
   }
 }
 

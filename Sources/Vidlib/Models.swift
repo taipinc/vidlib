@@ -17,6 +17,8 @@ struct Clip: Identifiable, Codable, Equatable {
   var notes: String?
   var kind: MediaKind?
   var gainDB: Double?
+  var proxyURL: URL?
+  var proxyIssue: String?
   var name: String { url.lastPathComponent }
   var displayTitle: String {
     let text = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -70,6 +72,8 @@ struct CatalogSnapshot: Codable {
 
 enum LibrarySelection: Hashable {
   case all
+  case video
+  case audio
   case collection(UUID)
   case folder(String)
 }

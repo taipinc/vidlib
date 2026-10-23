@@ -7,24 +7,19 @@ struct LibraryView: View {
   @State private var showCollectionSheet = false
   @State private var collectionName = ""
   @State private var showCache = false
-  @State private var showLUTs = false
   private let columns = [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 16)]
 
   var body: some View {
     NavigationSplitView {
       ScrollView {
         VStack(alignment: .leading, spacing: 18) {
-          VStack(alignment: .leading, spacing: 5) {
+          VStack(alignment: .leading, spacing: 4) {
             SidebarHeading("Library")
             SidebarLink(title: "All Media", image: "photo.stack", destination: .all)
-            Button {
-              showLUTs = true
-            } label: {
-              Label("Manage LUTs…", systemImage: "camera.filters").padding(8)
-            }
-            .buttonStyle(.plain).foregroundStyle(.secondary)
+            SidebarLink(title: "Video", image: "film", destination: .video)
+            SidebarLink(title: "Audio", image: "waveform", destination: .audio)
           }
-          VStack(alignment: .leading, spacing: 5) {
+          VStack(alignment: .leading, spacing: 4) {
             SidebarHeading("Collections")
             ForEach(library.catalog.collections) { collection in
               CollectionRow(collection: collection)
@@ -32,11 +27,17 @@ struct LibraryView: View {
             Button {
               showCollectionSheet = true
             } label: {
-              Label("New Collection", systemImage: "plus")
+              HStack(spacing: 8) {
+                Image(systemName: "plus").frame(width: 16)
+                Text("New Collection")
+              }.padding(.horizontal, 8).frame(height: 27).frame(
+                maxWidth: .infinity, alignment: .leading
+              )
+              .contentShape(Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(.secondary)
           }
-          VStack(alignment: .leading, spacing: 5) {
+          VStack(alignment: .leading, spacing: 4) {
             SidebarHeading("Folders")
             ForEach(library.folderTree) { FolderSidebarRow(node: $0) }
             if library.catalog.roots.isEmpty {
@@ -48,8 +49,18 @@ struct LibraryView: View {
       .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 320)
       .safeAreaInset(edge: .bottom) {
         VStack(alignment: .leading, spacing: 10) {
-          Label("Originals stay untouched", systemImage: "lock.shield")
-            .font(.caption).foregroundStyle(.secondary)
+          if library.importing {
+            HStack {
+              ProgressView().controlSize(.small)
+              Text(library.importStatus).lineLimit(2).font(.caption)
+              Button("Stop", action: library.cancelImport).controlSize(.small)
+            }
+          }
+          if let summary = library.importSummary {
+            Text(summary).font(.caption).foregroundStyle(.secondary)
+              .fixedSize(horizontal: false, vertical: true)
+              .accessibilityLabel("Refresh complete: " + summary)
+          }
           HStack {
             Button {
               library.addFolder()
@@ -66,7 +77,7 @@ struct LibraryView: View {
             } label: {
               Image(systemName: "gearshape")
             }
-            .help("Cache settings")
+            .help("Settings")
           }
         }.padding()
       }
@@ -150,19 +161,6 @@ struct LibraryView: View {
               }.padding(20)
             }
           }
-          Divider()
-          HStack(spacing: 8) {
-            if library.importing {
-              ProgressView().controlSize(.small)
-              Text(library.importStatus).lineLimit(1)
-              Spacer()
-              Button("Stop", action: library.cancelImport)
-            } else {
-              Text("\(library.catalog.clips.count) cataloged · Files referenced in place")
-              Spacer()
-              Button("Refresh", action: library.rescan).disabled(library.catalog.roots.isEmpty)
-            }
-          }.font(.caption).foregroundStyle(.secondary).padding(12)
         }.frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
         ViewerPane(controller: library.playback)
           .frame(minWidth: 360, idealWidth: 490, maxWidth: .infinity, maxHeight: .infinity)
@@ -173,6 +171,9 @@ struct LibraryView: View {
           ? "Vidlib" : "Vidlib · Test Catalog"
       )
       .searchable(text: $library.search, prompt: "Search names, tags, folders")
+    }
+    .background {
+      LibraryInteractionMonitor { library.dismissImportSummary() }.frame(width: 0, height: 0)
     }
     .sheet(isPresented: $showCollectionSheet) {
       VStack(alignment: .leading, spacing: 16) {
@@ -188,12 +189,11 @@ struct LibraryView: View {
     }
     .sheet(isPresented: $showCache) {
       VStack(alignment: .trailing) {
-        CacheSettingsView()
+        AppSettingsView()
         Button("Done") { showCache = false }.keyboardShortcut(.defaultAction).padding(
           [.horizontal, .bottom], 20)
       }
     }
-    .sheet(isPresented: $showLUTs) { LUTManagementView().environmentObject(library) }
     .alert(
       "Vidlib",
       isPresented: Binding(
@@ -228,7 +228,10 @@ struct SidebarLink: View {
     Button {
       library.selection = destination
     } label: {
-      Label(title, systemImage: image).lineLimit(1).padding(8).frame(
+      HStack(spacing: 8) {
+        Image(systemName: image).frame(width: 16)
+        Text(title).lineLimit(1)
+      }.padding(.horizontal, 8).frame(height: 27).frame(
         maxWidth: .infinity, alignment: .leading
       )
       .contentShape(Rectangle())
@@ -252,6 +255,8 @@ struct FolderSidebarRow: View {
             Image(systemName: expanded ? "chevron.down" : "chevron.right").font(.caption2).frame(
               width: 12)
           }.buttonStyle(.plain)
+        } else {
+          Color.clear.frame(width: 12, height: 12)
         }
         SidebarLink(title: node.name, image: "folder", destination: .folder(node.path)).help(
           node.path)
@@ -273,7 +278,7 @@ struct CollectionRow: View {
       select: { library.selection = .collection(collection.id) },
       accepts: { ids in !ids.isDisjoint(with: library.catalog.clips.map(\.id)) },
       drop: { library.addClips($0, to: collection.id) }
-    ).frame(maxWidth: .infinity).frame(height: 34)
+    ).frame(maxWidth: .infinity).frame(height: 27)
   }
 }
 
@@ -311,8 +316,18 @@ struct ClipCard: View {
         Spacer(minLength: 0)
         if clip.isAudio {
           Image(systemName: "waveform").font(.caption).foregroundStyle(.secondary)
-        } else if clip.lutID != nil {
-          Image(systemName: "camera.filters").font(.caption).foregroundStyle(.secondary)
+        } else {
+          if clip.lutID != nil {
+            Image(systemName: "camera.filters").font(.caption).foregroundStyle(.secondary)
+          }
+          if clip.proxyURL != nil {
+            Text("PXY").font(.system(size: 7, weight: .bold, design: .rounded))
+              .padding(.horizontal, 2).padding(.vertical, 1)
+              .overlay(RoundedRectangle(cornerRadius: 2).stroke(lineWidth: 1))
+              .foregroundStyle(.secondary).fixedSize()
+              .accessibilityLabel("Proxy available")
+              .help("Proxy available · updated on Refresh")
+          }
         }
       }
       Text(clip.date.map { $0.formatted(date: .abbreviated, time: .omitted) } ?? "Date unknown")
@@ -353,6 +368,14 @@ struct ViewerPane: View {
               Text("\(library.selectedIDs.count) selected").font(.caption).foregroundStyle(
                 .secondary)
             }
+            if !clip.isAudio {
+              Picker("Playback source", selection: $library.preferProxy) {
+                Text("Proxy").tag(true)
+                Text("Original").tag(false)
+              }.pickerStyle(.segmented).labelsHidden().frame(width: 160)
+                .help("Prefer an externally generated proxy, or play the original file")
+                .onChange(of: library.preferProxy) { library.updatePlayback() }
+            }
             Button {
               NSWorkspace.shared.activateFileViewerSelecting([clip.url])
             } label: {
@@ -360,6 +383,13 @@ struct ViewerPane: View {
             }
             .help("Show in Finder")
           }.padding(16)
+          if !clip.isAudio {
+            HStack(spacing: 6) {
+              Text(controller.usingProxy ? "Playing Proxy" : "Playing Original")
+              if let message = controller.proxyMessage { Text("· " + message) }
+            }.font(.caption).foregroundStyle(.secondary)
+              .padding(.horizontal, 16).padding(.bottom, 8)
+          }
           ScrollView {
             VStack(alignment: .leading, spacing: 0) {
               ZStack {
@@ -427,10 +457,6 @@ struct ViewerPane: View {
                           library.updatePlayback()
                         }
                     }
-                    Text(
-                      "Choose a LUT matching the recorded gamma and gamut. Camera profile detection is manual in this version."
-                    )
-                    .font(.caption).foregroundStyle(.secondary)
                   }
                   Divider()
                 }
@@ -514,7 +540,6 @@ struct ViewerPane: View {
                     "Date",
                     value: clip.date.map { $0.formatted(date: .abbreviated, time: .shortened) }
                       ?? "Unknown")
-                  Text(clip.dateSource).font(.caption).foregroundStyle(.secondary)
                   Text(clip.url.path).font(.caption).foregroundStyle(.secondary).textSelection(
                     .enabled
                   ).fixedSize(horizontal: false, vertical: true)
@@ -608,7 +633,8 @@ struct CacheSettingsView: View {
         .font(.caption).foregroundStyle(.secondary)
       }
       Section("Original Files") {
-        Label("Referenced in place · No media copies or proxies", systemImage: "lock.shield")
+        Label(
+          "Referenced in place · Originals and proxies stay untouched", systemImage: "lock.shield")
         Text(
           "NAS folders must be mounted in Finder. Wi-Fi playback depends on your connection; local thumbnails remain available when the NAS is offline."
         )
@@ -616,5 +642,36 @@ struct CacheSettingsView: View {
       }
     }.formStyle(.grouped).frame(width: 570, height: 430)
       .onAppear { library.refreshCacheUsage() }
+  }
+}
+
+/// Observe actual app input without intercepting clicks, typing, scrolling, or native player controls.
+private struct LibraryInteractionMonitor: NSViewRepresentable {
+  var action: () -> Void
+
+  func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+  func makeNSView(context: Context) -> NSView {
+    context.coordinator.start()
+    return NSView(frame: .zero)
+  }
+  func updateNSView(_ view: NSView, context: Context) { context.coordinator.action = action }
+  static func dismantleNSView(_ view: NSView, coordinator: Coordinator) { coordinator.stop() }
+
+  final class Coordinator {
+    var action: () -> Void
+    private var monitor: Any?
+    init(action: @escaping () -> Void) { self.action = action }
+    func start() {
+      monitor = NSEvent.addLocalMonitorForEvents(
+        matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .scrollWheel]
+      ) { [weak self] event in
+        self?.action()
+        return event
+      }
+    }
+    func stop() {
+      if let monitor { NSEvent.removeMonitor(monitor) }
+      monitor = nil
+    }
   }
 }

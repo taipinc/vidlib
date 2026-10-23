@@ -31,7 +31,7 @@ struct CollectionDropTarget: NSViewRepresentable {
   func sizeThatFits(_ proposal: ProposedViewSize, nsView: CollectionDropRow, context: Context)
     -> CGSize?
   {
-    CGSize(width: proposal.width ?? 180, height: 34)
+    CGSize(width: proposal.width ?? 180, height: 27)
   }
 }
 
@@ -52,7 +52,7 @@ final class CollectionDropRow: NSView {
     setAccessibilityRole(.button)
   }
   required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-  override var intrinsicContentSize: NSSize { NSSize(width: 180, height: 34) }
+  override var intrinsicContentSize: NSSize { NSSize(width: 180, height: 27) }
   override func mouseDown(with event: NSEvent) { select() }
   override func accessibilityPerformPress() -> Bool {
     select()

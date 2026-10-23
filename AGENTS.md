@@ -18,6 +18,7 @@ Vidlib is a native, local macOS media catalog. Preserve a small, straightforward
 - `ClipSelection.swift`: deterministic selection semantics and catalog-ID drag payload. IDs, never source file URLs, are dragged.
 - `LibraryView.swift` / `ManagementViews.swift`: plain SwiftUI UI. Collection drop targets live outside `List`; the list previously swallowed row-level drops. `CollectionDropTarget.swift` owns a native AppKit drag destination with full-row hit testing and a drag-over highlight. Keep drag-source creation free of observable state mutations. Transport catalog IDs as a custom data representation, with a validated native string fallback.
 - `MediaServices.swift`: background recursive discovery, bounded thumbnail work, shared audio-analysis jobs, disk-cache eviction, and player-item setup.
+- `ProxyServices.swift`: background matching of sibling `Proxy/<original stem>.<video extension>` files. Exclude Proxy directories from indexing at every depth; reject ambiguous original/proxy stems. Keep original URLs/metadata canonical. Proxy links/issues are optional catalog fields; playback rechecks them and falls back to originals on engine failures. Never generate or modify proxies.
 - `AudioServices.swift`: bounded-memory waveform/peak analysis and nondestructive audio gain through a processing tap. Preserve floating-point samples above unity. Do not use `AVPlayer.volume` for boost.
 - `CatalogStore.swift`: app-owned SQLite catalog and legacy backup. SQLite currently stores a single atomic JSON snapshot; do not imply relational indexing exists.
 
@@ -26,7 +27,7 @@ Vidlib is a native, local macOS media catalog. Preserve a small, straightforward
 - NAS access must not block the main actor. Avoid synchronous media I/O in SwiftUI view bodies.
 - Use lazy grids, cached thumbnails, bounded requests, and streaming audio analysis. Do not load full recordings into memory. Coalesce repeated waveform requests.
 - Refresh is manual and recursive over saved roots. New camera-import subfolders must be discovered without adding them separately. Do not introduce recurring timers or automatic startup scans without an explicit product requirement.
-- Refresh discovers additions; it does not delete offline entries, relink moved files, or refresh existing metadata. Keep these limits clear.
+- Refresh discovers additions and updates external proxy links; it does not delete offline originals, relink moved files, or refresh existing metadata. Proxy entries indexed by older versions are removed from the catalog/memberships only. Keep these limits clear.
 - Native player geometry must obey the proposed width/height rather than AVPlayerView's intrinsic size. Keep portrait thumbnails centered independently of the duration badge.
 - Avoid SwiftUI `VideoPlayer`: it crashed in superclass metadata initialization on the development OS/toolchain. Use the AppKit wrapper.
 

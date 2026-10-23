@@ -5,24 +5,40 @@ import UniformTypeIdentifiers
 @MainActor
 final class LibraryModel: ObservableObject {
   @Published var catalog = CatalogSnapshot()
-  @Published var selection: LibrarySelection = .all { didSet { reconcileSelection() } }
+  @Published var selection: LibrarySelection = .all {
+    didSet {
+      dismissImportSummary()
+      reconcileSelection()
+    }
+  }
   @Published var gridSelection = ClipSelection()
-  @Published var search = "" { didSet { reconcileSelection() } }
+  @Published var search = "" {
+    didSet {
+      dismissImportSummary()
+      reconcileSelection()
+    }
+  }
   @Published var sortByDate = true
   @Published var importing = false
   @Published var importStatus = ""
+  @Published private(set) var importSummary: String?
   @Published var errorMessage: String?
   @Published var cacheURL: URL
   @Published var cacheLimitGB: Double
   @Published var cacheBytes: Int64 = 0
   @Published var cacheGeneration = 0
   @Published var bypassLUT = false
+  @Published var preferProxy = true
   @Published var analyzingAudio = false
   let thumbnails: ThumbnailCache
   let playback = PlaybackController()
   private var store: CatalogStore?
   private let scanner = MediaScanner()
+  private let proxyDiscovery = ProxyDiscovery()
   private var importTask: Task<Void, Never>?
+  private var newVideoCount = 0
+  private var newAudioCount = 0
+  private var scanFailed = false
   private var saveTask: Task<Void, Never>?
   private var activeScopes: [URL] = []
   private var loadedLUTs: [UUID: CubeLUT] = [:]
@@ -96,6 +112,8 @@ final class LibraryModel: ObservableObject {
       collectionIDs = nil
     }
     return catalog.clips.filter { clip in
+      if selection == .video && clip.isAudio { return false }
+      if selection == .audio && !clip.isAudio { return false }
       if let collectionIDs, !collectionIDs.contains(clip.id) { return false }
       if case .folder(let path) = selection,
         clip.folder != path && !clip.folder.hasPrefix(path + "/")
@@ -116,6 +134,8 @@ final class LibraryModel: ObservableObject {
   var selectionTitle: String {
     switch selection {
     case .all: return "All Media"
+    case .video: return "Video"
+    case .audio: return "Audio"
     case .collection(let id): return catalog.collections.first { $0.id == id }?.name ?? "Collection"
     case .folder(let path): return URL(fileURLWithPath: path).lastPathComponent
     }
@@ -126,6 +146,7 @@ final class LibraryModel: ObservableObject {
   }
 
   func select(_ clip: Clip, modifiers: NSEvent.ModifierFlags = []) {
+    dismissImportSummary()
     let previous = selectedID
     let wasBypassed = bypassLUT
     gridSelection.select(
@@ -148,7 +169,9 @@ final class LibraryModel: ObservableObject {
         ? visibleClips.filter { selectedIDs.contains($0.id) }.map(\.id) : [clip.id])
   }
   func updatePlayback() {
-    playback.show(selectedClip, lut: bypassLUT ? nil : selectedClip.flatMap { lut(for: $0) })
+    playback.show(
+      selectedClip, lut: bypassLUT ? nil : selectedClip.flatMap { lut(for: $0) },
+      preferProxy: preferProxy)
   }
 
   func addFolder() {
@@ -161,6 +184,13 @@ final class LibraryModel: ObservableObject {
     panel.canChooseFiles = false
     panel.prompt = "Add to Catalog"
     guard panel.runModal() == .OK, let url = panel.url?.standardizedFileURL else { return }
+    guard
+      !url.pathComponents.contains(where: { $0.caseInsensitiveCompare("Proxy") == .orderedSame })
+    else {
+      errorMessage =
+        "Add the original media folder instead. Proxy folders are excluded from the catalog."
+      return
+    }
     let protected = [cacheURL, AppPaths.support]
     guard !protected.contains(where: { Self.overlaps(url, $0) }) else {
       errorMessage = "Choose a footage folder separate from Vidlib’s catalog and cache locations."
@@ -184,24 +214,37 @@ final class LibraryModel: ObservableObject {
   func rescan() {
     guard !importing else { return }
     let roots = catalog.roots
-    importing = true
-    importStatus = "Checking folders…"
+    beginImport(status: "Checking folders…")
     importTask = Task {
       for root in roots {
         guard !Task.isCancelled else { break }
         await scan(root)
       }
+      await refreshProxies()
       finishImport()
     }
   }
   private func startScan(_ root: SourceFolder) {
-    importing = true
-    importStatus = "Reading \(root.url.lastPathComponent)…"
+    beginImport(status: "Reading \(root.url.lastPathComponent)…")
     importTask = Task {
       await scan(root)
+      await refreshProxies()
       finishImport()
     }
   }
+  private func beginImport(status: String) {
+    importSummary = nil
+    newVideoCount = 0
+    newAudioCount = 0
+    scanFailed = false
+    importing = true
+    importStatus = status
+  }
+
+  func dismissImportSummary() {
+    if importSummary != nil { importSummary = nil }
+  }
+
   private func scan(_ root: SourceFolder) async {
     let known = Set(catalog.clips.map { $0.url.standardizedFileURL.path })
     do {
@@ -209,13 +252,52 @@ final class LibraryModel: ObservableObject {
         await self?.receive(clip)
       }
     } catch is CancellationError {} catch {
+      scanFailed = true
       errorMessage =
         "Could not finish scanning \(root.url.lastPathComponent): \(error.localizedDescription)"
     }
   }
+  /// Proxy links are auxiliary catalog data; originals and their metadata stay canonical.
+  func refreshProxies() async {
+    do {
+      let updates = try await proxyDiscovery.discover(catalog.clips)
+      try Task.checkCancellation()
+      let previous = selectedClip
+      var next = catalog
+      // Older builds may have indexed existing proxy files as separate entries.
+      let proxyIDs = Set(
+        next.clips.filter {
+          $0.url.deletingLastPathComponent().pathComponents.contains {
+            $0.caseInsensitiveCompare("Proxy") == .orderedSame
+          }
+        }.map(\.id))
+      next.clips.removeAll { proxyIDs.contains($0.id) }
+      for index in next.collections.indices { next.collections[index].clipIDs.subtract(proxyIDs) }
+      for index in next.clips.indices {
+        if let match = updates[next.clips[index].id] {
+          next.clips[index].proxyURL = match.url
+          next.clips[index].proxyIssue = match.issue
+        }
+      }
+      catalog = next
+      reconcileSelection()
+      if preferProxy, previous?.id == selectedClip?.id,
+        previous?.proxyURL != selectedClip?.proxyURL
+          || previous?.proxyIssue != selectedClip?.proxyIssue
+          || (playback.usingProxy && selectedClip?.proxyURL == nil)
+      {
+        updatePlayback()
+      }
+    } catch is CancellationError {} catch {
+      scanFailed = true
+      errorMessage = "Could not finish checking proxies: \(error.localizedDescription)"
+    }
+  }
+
   private func receive(_ clip: Clip) {
     guard !catalog.clips.contains(where: { $0.url == clip.url }) else { return }
     catalog.clips.append(clip)
+    if clip.isAudio { newAudioCount += 1 } else { newVideoCount += 1 }
     importStatus = "\(catalog.clips.count) files cataloged · \(clip.name)"
     saveTask?.cancel()
     saveTask = Task {
@@ -225,14 +307,57 @@ final class LibraryModel: ObservableObject {
     }
   }
   private func finishImport() {
+    let proxies = catalog.clips.filter { !$0.isAudio && $0.proxyURL != nil }.count
+    var parts = [
+      Task.isCancelled
+        ? "Refresh stopped" : "Found \(proxies) \(proxies == 1 ? "proxy" : "proxies")"
+    ]
+    if newVideoCount > 0 {
+      parts.append("\(newVideoCount) new \(newVideoCount == 1 ? "video" : "videos")")
+    }
+    if newAudioCount > 0 {
+      parts.append("\(newAudioCount) new audio \(newAudioCount == 1 ? "file" : "files")")
+    }
+    if scanFailed { parts.append("incomplete") }
     importing = false
     importStatus = ""
+    importSummary = parts.joined(separator: " · ")
     saveTask?.cancel()
     save()
   }
   func cancelImport() {
     importTask?.cancel()
     importStatus = "Stopping after the current file…"
+  }
+
+  /// Unregister a source and its catalog entries. Never changes source files.
+  @discardableResult
+  func removeSourceFolder(id: UUID) -> Bool {
+    guard !importing, let root = catalog.roots.first(where: { $0.id == id }), let store else {
+      return false
+    }
+    let removedIDs = Set(catalog.clips.filter { $0.rootID == id }.map(\.id))
+    var next = catalog
+    next.roots.removeAll { $0.id == id }
+    next.clips.removeAll { removedIDs.contains($0.id) }
+    for index in next.collections.indices { next.collections[index].clipIDs.subtract(removedIDs) }
+    do { try store.save(next) } catch {
+      errorMessage = "Could not remove the folder from the catalog: \(error.localizedDescription)"
+      return false
+    }
+    catalog = next
+    for scope in activeScopes where scope == root.url {
+      scope.stopAccessingSecurityScopedResource()
+    }
+    activeScopes.removeAll { $0 == root.url }
+    if case .folder(let path) = selection,
+      !catalog.roots.contains(where: { path == $0.url.path || path.hasPrefix($0.url.path + "/") })
+    {
+      selection = .all
+    } else {
+      reconcileSelection()
+    }
+    return true
   }
 
   func createCollection(name: String) {

@@ -4,13 +4,18 @@ import CoreImage
 import CryptoKit
 
 actor MediaScanner {
-  static let extensions = Set(["mp4", "mov", "m4v", "mxf", "mts", "m2ts", "avi", "mkv"]).union(
+  static let extensions = ProxyDiscovery.videoExtensions.union(
     MediaKind.audioExtensions)
 
   func scan(
     root: SourceFolder, known: Set<String>, receive: @escaping @Sendable (Clip) async -> Void
   ) async throws {
-    let keys: [URLResourceKey] = [.isRegularFileKey, .creationDateKey]
+    guard
+      !root.url.pathComponents.contains(where: {
+        $0.caseInsensitiveCompare("Proxy") == .orderedSame
+      })
+    else { return }
+    let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .creationDateKey]
     var scanError: Error?
     guard
       let enumerator = FileManager.default.enumerator(
@@ -24,6 +29,12 @@ actor MediaScanner {
     // Directory iteration and metadata reads happen off the main actor.
     while let url = enumerator.nextObject() as? URL {
       try Task.checkCancellation()
+      if ProxyDiscovery.isProxyDirectory(url),
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+      {
+        enumerator.skipDescendants()
+        continue
+      }
       guard Self.extensions.contains(url.pathExtension.lowercased()),
         !known.contains(url.standardizedFileURL.path),
         let resources = try? url.resourceValues(forKeys: Set(keys)), resources.isRegularFile == true
@@ -215,79 +226,177 @@ final class PlaybackController: ObservableObject {
   let player = AVPlayer()
   @Published var error: String?
   @Published var loading = false
+  @Published var usingProxy = false
+  @Published var proxyMessage: String?
   private var task: Task<Void, Never>?
   private var observation: NSKeyValueObservation?
+  private var failureObservation: NSObjectProtocol?
+  private let proxyDiscovery = ProxyDiscovery()
+  private var generation = UUID()
   private let context = CIContext(options: [
     .workingColorSpace: NSNull(), .cacheIntermediates: false,
   ])
   private var currentID: UUID?
 
-  func show(_ clip: Clip?, lut: CubeLUT?) {
+  func show(_ clip: Clip?, lut: CubeLUT?, preferProxy: Bool = true) {
     let sameClip = clip?.id == currentID
     let position = sameClip ? player.currentTime() : .zero
-    let wasPlaying = sameClip && player.rate > 0
+    let resume = sameClip && player.rate > 0
     currentID = clip?.id
+    generation = UUID()
+    let token = generation
     task?.cancel()
-    observation = nil
+    clearObservers()
     player.pause()
     player.replaceCurrentItem(with: nil)
     error = nil
+    usingProxy = false
+    proxyMessage = nil
     guard let clip else {
       loading = false
       return
     }
     loading = true
     task = Task { [self] in
-      let asset = AVURLAsset(url: clip.url)
       do {
-        guard try await asset.load(.isPlayable) else {
-          throw NSError(
-            domain: "Vidlib.Playback", code: 1,
-            userInfo: [
-              NSLocalizedDescriptionKey:
-                "This format cannot be played by the current macOS media engine. The file may also be offline."
-            ])
-        }
-        try Task.checkCancellation()
-        let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 5
-        if clip.isAudio, clip.playbackGainDB != 0 {
-          let tracks = try await asset.loadTracks(withMediaType: .audio)
-          let mix = AVMutableAudioMix()
-          mix.inputParameters = try tracks.map { track in
-            let parameters = AVMutableAudioMixInputParameters(track: track)
-            parameters.audioTapProcessor = try AudioGainTap.make(db: clip.playbackGainDB)
-            return parameters
-          }
-          item.audioMix = mix
-        }
-        if let lut, !clip.isAudio {
-          let ciContext = context
-          item.videoComposition = try await AVVideoComposition.videoComposition(
-            with: asset,
-            applyingCIFiltersWithHandler: { request in
-              let source = request.sourceImage
-              request.finish(
-                with: lut.apply(to: source).cropped(to: source.extent), context: ciContext)
-            })
-        }
-        try Task.checkCancellation()
-        observation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-          Task { @MainActor [weak self] in
-            guard let self, self.player.currentItem === item else { return }
-            if item.status == .failed {
-              self.error =
-                item.error?.localizedDescription ?? "Playback failed. Check the NAS connection."
-              self.loading = false
-            } else if item.status == .readyToPlay {
-              self.loading = false
+        if preferProxy, !clip.isAudio {
+          // Check again at playback time: a saved link may have gone offline or become ambiguous.
+          let match = try await proxyDiscovery.discover([clip])[clip.id] ?? ProxyMatch()
+          try Task.checkCancellation()
+          guard token == generation else { return }
+          proxyMessage = match.issue
+          if let url = match.url {
+            do {
+              try await open(
+                clip, lut: lut, url: url, isProxy: true,
+                position: position, resume: resume, token: token)
+              return
+            } catch is CancellationError { return } catch {
+              guard token == generation else { return }
+              proxyMessage = "Proxy unavailable or unsupported; using original."
             }
+          } else if proxyMessage == nil {
+            proxyMessage = "No matching proxy found; using original."
           }
         }
-        player.replaceCurrentItem(with: item)
-        if sameClip, position.isValid { await player.seek(to: position) }
-        if wasPlaying { player.play() }
+        try await open(
+          clip, lut: lut, url: clip.url, isProxy: false,
+          position: position, resume: resume, token: token)
       } catch is CancellationError {} catch {
+        guard token == generation else { return }
+        self.error = error.localizedDescription
+        loading = false
+      }
+    }
+  }
+
+  private func clearObservers() {
+    observation = nil
+    if let failureObservation { NotificationCenter.default.removeObserver(failureObservation) }
+    failureObservation = nil
+  }
+
+  private func open(
+    _ clip: Clip, lut: CubeLUT?, url: URL, isProxy: Bool,
+    position: CMTime, resume: Bool, token: UUID
+  ) async throws {
+    let asset = AVURLAsset(url: url)
+    guard try await asset.load(.isPlayable) else {
+      throw NSError(
+        domain: "Vidlib.Playback", code: 1,
+        userInfo: [
+          NSLocalizedDescriptionKey:
+            "This format cannot be played by the current macOS media engine. The file may also be offline."
+        ])
+    }
+    if isProxy, try await asset.loadTracks(withMediaType: .video).isEmpty {
+      throw NSError(
+        domain: "Vidlib.Playback", code: 2,
+        userInfo: [
+          NSLocalizedDescriptionKey: "The proxy has no video track."
+        ])
+    }
+    let item = AVPlayerItem(asset: asset)
+    item.preferredForwardBufferDuration = 5
+    if clip.isAudio, clip.playbackGainDB != 0 {
+      let tracks = try await asset.loadTracks(withMediaType: .audio)
+      let mix = AVMutableAudioMix()
+      mix.inputParameters = try tracks.map { track in
+        let parameters = AVMutableAudioMixInputParameters(track: track)
+        parameters.audioTapProcessor = try AudioGainTap.make(db: clip.playbackGainDB)
+        return parameters
+      }
+      item.audioMix = mix
+    }
+    if let lut, !clip.isAudio {
+      let ciContext = context
+      item.videoComposition = try await AVVideoComposition.videoComposition(
+        with: asset,
+        applyingCIFiltersWithHandler: { request in
+          let source = request.sourceImage
+          request.finish(with: lut.apply(to: source).cropped(to: source.extent), context: ciContext)
+        })
+    }
+    try Task.checkCancellation()
+    guard token == generation else { throw CancellationError() }
+    clearObservers()
+    usingProxy = isProxy
+    player.replaceCurrentItem(with: item)
+    observation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+      Task { @MainActor [weak self] in
+        guard let self, token == self.generation, self.player.currentItem === item else { return }
+        if item.status == .failed {
+          self.failed(
+            item, clip: clip, lut: lut, isProxy: isProxy,
+            initialPosition: position, resume: resume, token: token)
+        } else if item.status == .readyToPlay {
+          self.loading = false
+        }
+      }
+    }
+    failureObservation = NotificationCenter.default.addObserver(
+      forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        guard let self, token == self.generation, self.player.currentItem === item else { return }
+        self.failed(
+          item, clip: clip, lut: lut, isProxy: isProxy,
+          initialPosition: position, resume: resume, token: token)
+      }
+    }
+    if position.isNumeric, position.seconds > 0 { await player.seek(to: position) }
+    try Task.checkCancellation()
+    guard token == generation, player.currentItem === item else { return }
+    if resume { player.play() }
+  }
+
+  private func failed(
+    _ item: AVPlayerItem, clip: Clip, lut: CubeLUT?, isProxy: Bool,
+    initialPosition: CMTime, resume: Bool, token: UUID
+  ) {
+    guard isProxy else {
+      error = item.error?.localizedDescription ?? "Playback failed. Check the NAS connection."
+      loading = false
+      return
+    }
+    // Retry exactly once with the canonical original, including failures after playback starts.
+    let time = player.currentTime()
+    let position = time.isNumeric && time.seconds > 0 ? time : initialPosition
+    let shouldResume = player.rate > 0 || (loading && resume)
+    clearObservers()
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    usingProxy = false
+    loading = true
+    proxyMessage = "Proxy playback failed; using original."
+    task?.cancel()
+    task = Task { [self] in
+      do {
+        try await open(
+          clip, lut: lut, url: clip.url, isProxy: false,
+          position: position, resume: shouldResume, token: token)
+      } catch is CancellationError {} catch {
+        guard token == generation else { return }
         self.error = error.localizedDescription
         loading = false
       }
