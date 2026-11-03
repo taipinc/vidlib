@@ -19,6 +19,7 @@ struct Clip: Identifiable, Codable, Equatable {
   var gainDB: Double?
   var proxyURL: URL?
   var proxyIssue: String?
+  var rotation: VideoRotation?
   var name: String { url.lastPathComponent }
   var displayTitle: String {
     let text = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -35,6 +36,28 @@ struct Clip: Identifiable, Codable, Equatable {
     let seconds = Int(duration)
     return String(format: "%d:%02d", seconds / 60, seconds % 60)
   }
+}
+
+/// Correction applied after the file's embedded orientation, without changing the file.
+enum VideoRotation: Int, Codable, CaseIterable {
+  case clockwise90 = 90
+  case halfTurn = 180
+  case counterclockwise90 = 270
+  var label: String {
+    switch self {
+    case .clockwise90: return "90° clockwise"
+    case .halfTurn: return "180°"
+    case .counterclockwise90: return "90° counterclockwise"
+    }
+  }
+  var swapsDimensions: Bool { self != .halfTurn }
+}
+
+struct EditingProject: Identifiable, Codable {
+  var id = UUID()
+  var name: String
+  var clipIDs: Set<UUID> = []
+  var resolveProjectName: String?
 }
 
 enum MediaKind: String, Codable {
@@ -68,6 +91,12 @@ struct CatalogSnapshot: Codable {
   var collections: [ClipCollection] = []
   var luts: [LUTReference] = []
   var schemaVersion: Int? = 2
+  // Optional storage preserves decoding of every earlier catalog snapshot.
+  var projects: [EditingProject]?
+  var editingProjects: [EditingProject] {
+    get { projects ?? [] }
+    set { projects = newValue }
+  }
 }
 
 enum LibrarySelection: Hashable {
@@ -75,6 +104,7 @@ enum LibrarySelection: Hashable {
   case video
   case audio
   case collection(UUID)
+  case project(UUID)
   case folder(String)
 }
 

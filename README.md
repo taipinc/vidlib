@@ -32,21 +32,44 @@ Tests generate media in temporary directories and use isolated databases. The au
 - Refresh leaves a short summary of discovered proxies and newly added video/audio files in the sidebar until the next click, keypress, or scroll in the app. Stopped or incomplete scans are labeled accordingly.
 - Refresh adds new files, avoids duplicates, and rechecks external proxy links. It does not remove offline entries, detect file replacements, update existing metadata, or relink moved files.
 - NAS folders must already be mounted in Finder. Local thumbnails remain browsable offline; playback requires access to the selected original or external proxy.
-- The sidebar has separate Library, Collections, and Folders areas. All Media, Video, and Audio are peer filters; each works with search. Expand an individual folder to explore its subfolders.
-- **Settings → Library → Manage Folders** lists added source roots and their catalog-entry counts. Removing a root (after confirmation) unregisters it from Refresh and removes entries imported through it, including their saved edits and collection memberships. Original media is never deleted. Separately added roots remain registered. Removal is disabled during import; this prevents an active scan from re-adding entries.
+- The sidebar has separate Library, Collections, Projects, and Folders areas. All Media, Video, and Audio are peer filters; each works with search. Expand an individual folder to explore its subfolders.
+- **Settings → Library → Manage Folders** lists added source roots and their catalog-entry counts. Removing a root (after confirmation) unregisters it from Refresh and removes entries imported through it, including their saved edits and collection/project memberships. Original media is never deleted. Separately added roots remain registered. Removal is disabled during import; this prevents an active scan from re-adding entries.
 - Shift-click selects a range in the current display order. Command-click toggles individual files; Command-Shift-click adds a range.
 - Drag a selected thumbnail onto a collection to add the selected group. Drag an unselected thumbnail to add just that file. The collection highlights during a supported drag. Only catalog IDs are transferred; originals are not moved or copied.
 - LUT assignment, tags, collection membership, and audio gain support batch selection. Mixed video/audio selections apply LUTs only to videos and gain only to audio. Batch tags add to existing tags.
 - Give a file a **title** and **description** in the viewer and save its details. A nonempty title replaces its filename in the grid; the filename remains visible in File Details. Search includes titles, descriptions, filenames, tags, and folder paths.
 - Recording dates use readable embedded metadata, falling back to a filesystem creation date. Camera clocks and timezones may be inaccurate.
 
+## Projects and Resolve
+
+**Projects** sits between Collections and Folders. Create an empty project in the sidebar, or use **Add to Project → New Project…** on selected files. Add references by dragging thumbnails onto a project or using Add to Project; remove selected references with **Remove from This Project**. Projects and Collections have independent membership and accept both video and audio.
+
+Open a Vidlib project and click **Send to Resolve…**. Choose all project files or just the selected members (independent of the search filter when sending the entire project). Choose either:
+
+- **Currently open project**: open the destination in Resolve and enter its exact name. Vidlib checks the name and refuses a mismatch rather than switching projects.
+- **Create new project**: enter a unique name. Resolve creates it in the currently selected project-library folder. Save current work in Resolve first.
+
+Direct sending requires **DaVinci Resolve Studio**, running with **Preferences → System → General → External scripting using → Local**. The bridge uses Resolve’s bundled Lua interpreter at its standard macOS installation path under `/Applications/DaVinci Resolve`. It does not require Python, a Vidlib plugin, network scripting, or the Codex Resolve connector. The installed Resolve 21.1 scripting documentation documents this interpreter; older Resolve versions have not been validated.
+
+New references go into a bin named `Vidlib · <name> [<catalog project ID>]`. Every send scans the destination media pool recursively and skips exact original paths already present anywhere in that project; existing clips are left in their current bins. Add more files to the Vidlib project and send again. Unavailable/unsupported files are counted separately; a partial import is not rolled back. Retrying checks the live media pool again. Resolve may report equivalent paths differently (for example, symlink aliases), so path-based deduplication is not a general media-identity system. Save the editing project in Resolve after import; Vidlib does not explicitly save existing editing work. The last destination name is remembered for the next send.
+
+Sending imports original file references only. It creates no timeline and does not transfer Vidlib titles, descriptions, tags, LUTs, gain, rotation, or proxy links. Resolve manages its own project/cache behavior. Removing a Vidlib membership never removes Resolve media. No automatic or bidirectional sync is implemented.
+
+### Integration research
+
+Blackmagic’s installed developer documentation at `/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/README.txt` exposes `CreateProject`, `GetCurrentProject`, media-pool `ImportMedia`, recursive folder/clip enumeration, clip file paths, and unique IDs. Those calls make incremental sending practical. They also provide the building blocks for a future explicit sync: persist editor project/media IDs and reconcile memberships, with separate policies for renames, missing media, and removals. Sync would need more than a list of previously sent paths and is deliberately outside this version.
+
+Premiere is feasible through a companion **UXP plugin**: Adobe’s [Project API](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/project) provides project creation/opening, active-project access, and `importFiles`; the documented Project class starts at Premiere 25.6. A companion plugin would need a local handoff mechanism and file permissions to receive Vidlib’s path manifest. Adobe also documents [media drag and drop from UXP plugins](https://developer.adobe.com/premiere-pro/uxp/plugins/tutorials/drag-and-drop/), which is a plugin workflow rather than a direct native-app API. No Premiere integration is included yet. See Adobe’s [UXP overview](https://developer.adobe.com/premiere-pro/uxp/) for its extension model.
+
 ## Video and LUTs
 
-Playback and seeking use macOS's media stack through native `AVPlayerView`. The viewer grows with available width and the clip's aspect ratio; settings scroll below it. Hover over player controls for fullscreen playback; Escape returns to the library. Narrow/portrait thumbnails are centered in their cells.
+Playback and seeking use macOS's media stack through native `AVPlayerView`. The viewer grows with available width and the player's actual displayed aspect ratio, including embedded orientation, rotation corrections, and the active proxy/original; settings scroll below it. Hover over player controls for fullscreen playback; Escape returns to the library. Narrow/portrait thumbnails are centered in their cells.
+
+In **File Details → Rotation**, choose a 90° clockwise, 180°, or 90° counterclockwise correction from the file’s embedded orientation. **Use File Orientation** resets it. The correction is saved per video in the catalog and used for thumbnails and original/proxy playback, including LUT previews. It does not change source metadata or send a rotation adjustment to an editor. File Details continues to show the imported resolution.
 
 ### External proxy playback
 
-Vidlib discovers externally generated proxies using the Blackmagic Proxy Generator folder convention: `Camera/Shot.mp4` matches `Camera/Proxy/Shot.mov`. This works at any directory depth. Filename stems match without regard to extension or case; `.mov` and other recognized video extensions are considered. `Proxy` directories (case-insensitive) are excluded from normal video/audio indexing, including their descendants. Refresh also removes any proxy entries indexed by older versions from the catalog and collections only; files remain untouched.
+Vidlib discovers externally generated proxies using the Blackmagic Proxy Generator folder convention: `Camera/Shot.mp4` matches `Camera/Proxy/Shot.mov`. This works at any directory depth. Filename stems match without regard to extension or case; `.mov` and other recognized video extensions are considered. `Proxy` directories (case-insensitive) are excluded from normal video/audio indexing, including their descendants. Refresh also removes any proxy entries indexed by older versions from the catalog and collection/project memberships only; files remain untouched.
 
 A small outlined **PXY** badge appears beside the LUT icon on video cards with a discovered proxy. Badges reflect the latest Refresh; actual playback still checks availability and codec support.
 
@@ -100,6 +123,7 @@ See [AGENTS.md](AGENTS.md) for data-safety invariants, architecture, performance
 - `LibraryView.swift`, `ManagementViews.swift`: library, viewer, settings, LUT manager, and waveform UI.
 - `CollectionDropTarget.swift`: native collection row drag destination and visual feedback.
 - `MediaServices.swift`: discovery, cache, and playback setup.
+- `ProjectViews.swift`, `ResolveServices.swift`: project organization, explicit editor handoff, Lua serialization and import results.
 - `ProxyServices.swift`: background external-proxy matching and ambiguity checks.
 - `AudioServices.swift`: waveform/peak analysis and playback gain.
 - `CatalogStore.swift`: SQLite storage and migration backup.
@@ -109,6 +133,6 @@ For a synthetic UI catalog, use **a separate app bundle identifier** and set `VI
 
 `zsh scripts/build-app.sh --preview` builds `build/Vidlib Preview.app` with a separate bundle identifier for this purpose. Start its executable with those environment variables set; opening it without a data override uses the normal catalog location.
 
-Tests cover source preservation, migration, title/description search, LUT renaming, mixed-media batch edits, recursive discovery/deduplication, float waveform analysis, actual audio-mix gain output, selection ranges, and native drag-payload transport, external proxy discovery/exclusion, refresh updates, and actual proxy/original playback with fallback. Generated fixtures include floating-point samples above unity.
+Tests cover source preservation, migration, title/description search, LUT renaming, mixed-media batch edits, recursive discovery/deduplication, float waveform analysis, actual audio-mix gain output, selection ranges, and native drag-payload transport, external proxy discovery/exclusion, refresh updates, and actual proxy/original playback with fallback. Generated fixtures include floating-point samples above unity. Project tests cover older snapshots, independent membership, cleanup, persistence, and source preservation. Rotation tests cover embedded orientation, thumbnail invalidation, LUT rendering, and proxy/original playback. Resolve import tests run the generated Lua against a fake API in the bundled interpreter (skipped if not installed); they never open or modify a real Resolve project. Live Resolve/Premiere interoperability is not covered by automated tests.
 
 Still to add: relinking, individual catalog-entry removal, collection renaming/deletion, smart collections, manual date correction, scrub-preview strips, and broader camera/network/color validation.

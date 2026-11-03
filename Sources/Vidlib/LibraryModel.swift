@@ -108,6 +108,8 @@ final class LibraryModel: ObservableObject {
     let collectionIDs: Set<UUID>?
     if case .collection(let id) = selection {
       collectionIDs = catalog.collections.first { $0.id == id }?.clipIDs ?? []
+    } else if case .project(let id) = selection {
+      collectionIDs = catalog.editingProjects.first { $0.id == id }?.clipIDs ?? []
     } else {
       collectionIDs = nil
     }
@@ -137,6 +139,7 @@ final class LibraryModel: ObservableObject {
     case .video: return "Video"
     case .audio: return "Audio"
     case .collection(let id): return catalog.collections.first { $0.id == id }?.name ?? "Collection"
+    case .project(let id): return catalog.editingProjects.first { $0.id == id }?.name ?? "Project"
     case .folder(let path): return URL(fileURLWithPath: path).lastPathComponent
     }
   }
@@ -273,6 +276,11 @@ final class LibraryModel: ObservableObject {
         }.map(\.id))
       next.clips.removeAll { proxyIDs.contains($0.id) }
       for index in next.collections.indices { next.collections[index].clipIDs.subtract(proxyIDs) }
+      next.editingProjects = next.editingProjects.map { project in
+        var project = project
+        project.clipIDs.subtract(proxyIDs)
+        return project
+      }
       for index in next.clips.indices {
         if let match = updates[next.clips[index].id] {
           next.clips[index].proxyURL = match.url
@@ -341,6 +349,11 @@ final class LibraryModel: ObservableObject {
     next.roots.removeAll { $0.id == id }
     next.clips.removeAll { removedIDs.contains($0.id) }
     for index in next.collections.indices { next.collections[index].clipIDs.subtract(removedIDs) }
+    next.editingProjects = next.editingProjects.map { project in
+      var project = project
+      project.clipIDs.subtract(removedIDs)
+      return project
+    }
     do { try store.save(next) } catch {
       errorMessage = "Could not remove the folder from the catalog: \(error.localizedDescription)"
       return false
@@ -358,6 +371,55 @@ final class LibraryModel: ObservableObject {
       reconcileSelection()
     }
     return true
+  }
+
+  func createProject(name: String, clipIDs: Set<UUID> = []) {
+    let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else { return }
+    let project = EditingProject(
+      name: name, clipIDs: clipIDs.intersection(catalog.clips.map(\.id)))
+    catalog.editingProjects.append(project)
+    selection = .project(project.id)
+    save()
+  }
+
+  @discardableResult
+  func addClips(_ ids: Set<UUID>, toProject id: UUID) -> Bool {
+    guard let index = catalog.editingProjects.firstIndex(where: { $0.id == id }) else {
+      return false
+    }
+    let valid = ids.intersection(catalog.clips.map(\.id))
+    guard !valid.isEmpty else { return false }
+    catalog.editingProjects[index].clipIDs.formUnion(valid)
+    save()
+    return true
+  }
+
+  func removeSelectedFromProject() {
+    guard case .project(let id) = selection,
+      let index = catalog.editingProjects.firstIndex(where: { $0.id == id })
+    else { return }
+    catalog.editingProjects[index].clipIDs.subtract(selectedIDs)
+    save()
+    reconcileSelection()
+  }
+
+  func rememberResolveTarget(_ name: String, projectID: UUID) {
+    guard let index = catalog.editingProjects.firstIndex(where: { $0.id == projectID }) else {
+      return
+    }
+    catalog.editingProjects[index].resolveProjectName = name
+    save()
+  }
+
+  func setRotation(_ rotation: VideoRotation?) {
+    guard selectedIDs.count == 1,
+      let index = catalog.clips.firstIndex(where: { $0.id == selectedID }),
+      !catalog.clips[index].isAudio
+    else { return }
+    catalog.clips[index].rotation = rotation
+    save()
+    updatePlayback()
   }
 
   func createCollection(name: String) {

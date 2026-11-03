@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import XCTest
 
 @testable import Vidlib
@@ -226,7 +227,9 @@ final class ProxyTests: XCTestCase {
     XCTAssertNil(restored.proxyURL)
   }
 
-  private func makeVideo(_ url: URL, width: Int) async throws {
+  private func makeVideo(_ url: URL, width: Int, transform: CGAffineTransform = .identity)
+    async throws
+  {
     try FileManager.default.createDirectory(
       at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -241,6 +244,7 @@ final class ProxyTests: XCTestCase {
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
         kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: 48,
       ])
+    input.transform = transform
     writer.add(input)
     XCTAssertTrue(writer.startWriting())
     writer.startSession(atSourceTime: .zero)
@@ -269,6 +273,79 @@ final class ProxyTests: XCTestCase {
     await writer.finishWriting()
     XCTAssertEqual(
       writer.status, .completed, writer.error?.localizedDescription ?? "Video writer failed")
+  }
+
+  @MainActor
+  func testRotationRespectsEmbeddedOrientationThumbnailsLUTAndProxyPlayback() async throws {
+    let dir = try directory()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let original = dir.appendingPathComponent("Shot.mov")
+    let proxy = dir.appendingPathComponent("Proxy/Shot.mov")
+    let metadata = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 48, ty: 0)
+    try await makeVideo(original, width: 128, transform: metadata)
+    try await makeVideo(proxy, width: 64, transform: metadata)
+    let bytes = try Data(contentsOf: original)
+    var clip = Clip(url: original, rootID: UUID(), duration: 2, width: 128, height: 48)
+    let cache = ThumbnailCache(directory: dir.appendingPathComponent("Cache"), limitGB: 1)
+    let normalData = await cache.thumbnail(clip: clip, lut: nil, lutID: nil)
+    let normal = try XCTUnwrap(normalData)
+    let normalImage = try XCTUnwrap(NSBitmapImageRep(data: normal))
+    XCTAssertLessThan(normalImage.pixelsWide, normalImage.pixelsHigh)
+    clip.rotation = .clockwise90
+    let rotatedData = await cache.thumbnail(clip: clip, lut: nil, lutID: nil)
+    let rotated = try XCTUnwrap(rotatedData)
+    let rotatedImage = try XCTUnwrap(NSBitmapImageRep(data: rotated))
+    XCTAssertGreaterThan(rotatedImage.pixelsWide, rotatedImage.pixelsHigh)
+    let controller = PlaybackController()
+    defer { controller.show(nil, lut: nil) }
+    let lut = try CubeLUT(
+      contents: "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1")
+    // Catalog dimensions are encoded dimensions, not the metadata-oriented picture.
+    // Verify the geometry used by the panel for both directions of the correction.
+    for useProxy in [true, false] {
+      clip.rotation = nil
+      controller.show(clip, lut: nil, preferProxy: useProxy)
+      try await waitForPlayback(controller)
+      let portraitRatio = try XCTUnwrap(controller.presentationAspectRatio)
+      XCTAssertEqual(portraitRatio, 48.0 / (useProxy ? 64 : 128), accuracy: 0.001)
+      clip.rotation = .clockwise90
+      controller.show(clip, lut: nil, preferProxy: useProxy)
+      try await waitForPlayback(controller)
+      let horizontalRatio = try XCTUnwrap(controller.presentationAspectRatio)
+      XCTAssertEqual(horizontalRatio, (useProxy ? 64.0 : 128) / 48, accuracy: 0.001)
+      controller.show(clip, lut: lut, preferProxy: useProxy)
+      try await waitForPlayback(controller)
+      XCTAssertEqual(controller.usingProxy, useProxy)
+      let item = try XCTUnwrap(controller.player.currentItem)
+      let generator = AVAssetImageGenerator(asset: item.asset)
+      generator.appliesPreferredTrackTransform = true
+      generator.videoComposition = item.videoComposition
+      let image = try await generator.image(at: .zero).image
+      XCTAssertEqual(image.width, useProxy ? 64 : 128)
+      XCTAssertEqual(image.height, 48)
+      let lutRatio = try XCTUnwrap(controller.presentationAspectRatio)
+      XCTAssertEqual(lutRatio, (useProxy ? 64.0 : 128) / 48, accuracy: 0.001)
+    }
+    controller.show(nil, lut: nil)
+    XCTAssertNil(controller.presentationAspectRatio)
+    XCTAssertEqual(try Data(contentsOf: original), bytes)
+    for rotation in VideoRotation.allCases {
+      let composition = try await VideoOrientation.asset(
+        AVURLAsset(url: original), rotation: rotation)
+      let generator = AVAssetImageGenerator(asset: composition)
+      generator.appliesPreferredTrackTransform = true
+      let image = try await generator.image(at: .zero).image
+      XCTAssertEqual(image.width, rotation.swapsDimensions ? 128 : 48)
+      XCTAssertEqual(image.height, rotation.swapsDimensions ? 48 : 128)
+    }
+    let transformed = VideoOrientation.transform(
+      size: CGSize(width: 128, height: 48),
+      preferred: .identity, rotation: .clockwise90)
+    let origin = CGPoint.zero.applying(transformed)
+    XCTAssertEqual(origin.x, 48, accuracy: 0.0001)
+    XCTAssertEqual(origin.y, 0, accuracy: 0.0001)
+    let right = CGPoint(x: 128, y: 0).applying(transformed)
+    XCTAssertEqual(right.y, 128, accuracy: 0.0001)
   }
 
   @MainActor

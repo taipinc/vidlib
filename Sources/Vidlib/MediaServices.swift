@@ -99,7 +99,8 @@ actor ThumbnailCache {
   }
 
   func thumbnail(clip: Clip, lut: CubeLUT?, lutID: UUID?) async -> Data? {
-    let key = "\(clip.id)-\(clip.isAudio ? "audio" : lutID?.uuidString ?? "original")-v2"
+    let key =
+      "\(clip.id)-\(clip.isAudio ? "audio" : lutID?.uuidString ?? "original")-rotation\(clip.rotation?.rawValue ?? 0)-v3"
     let name =
       SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined() + ".jpg"
     let destination = directory.appendingPathComponent(name)
@@ -145,6 +146,10 @@ actor ThumbnailCache {
           from: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
       {
         cgImage = adjusted
+      }
+      if let rotation = clip.rotation {
+        let rotated = VideoOrientation.image(CIImage(cgImage: cgImage), rotation: rotation)
+        if let result = context.createCGImage(rotated, from: rotated.extent) { cgImage = result }
       }
       let bitmap = NSBitmapImageRep(cgImage: cgImage)
       guard let data = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.75])
@@ -228,8 +233,16 @@ final class PlaybackController: ObservableObject {
   @Published var loading = false
   @Published var usingProxy = false
   @Published var proxyMessage: String?
+  @Published private(set) var presentationSize: CGSize = .zero
+  var presentationAspectRatio: CGFloat? {
+    guard presentationSize.width.isFinite, presentationSize.height.isFinite,
+      presentationSize.width > 0, presentationSize.height > 0
+    else { return nil }
+    return presentationSize.width / presentationSize.height
+  }
   private var task: Task<Void, Never>?
   private var observation: NSKeyValueObservation?
+  private var presentationObservation: NSKeyValueObservation?
   private var failureObservation: NSObjectProtocol?
   private let proxyDiscovery = ProxyDiscovery()
   private var generation = UUID()
@@ -252,6 +265,7 @@ final class PlaybackController: ObservableObject {
     error = nil
     usingProxy = false
     proxyMessage = nil
+    presentationSize = .zero
     guard let clip else {
       loading = false
       return
@@ -292,6 +306,7 @@ final class PlaybackController: ObservableObject {
 
   private func clearObservers() {
     observation = nil
+    presentationObservation = nil
     if let failureObservation { NotificationCenter.default.removeObserver(failureObservation) }
     failureObservation = nil
   }
@@ -316,7 +331,13 @@ final class PlaybackController: ObservableObject {
           NSLocalizedDescriptionKey: "The proxy has no video track."
         ])
     }
-    let item = AVPlayerItem(asset: asset)
+    let playbackAsset: AVAsset
+    if let rotation = clip.rotation, !clip.isAudio {
+      playbackAsset = try await VideoOrientation.asset(asset, rotation: rotation)
+    } else {
+      playbackAsset = asset
+    }
+    let item = AVPlayerItem(asset: playbackAsset)
     item.preferredForwardBufferDuration = 5
     if clip.isAudio, clip.playbackGainDB != 0 {
       let tracks = try await asset.loadTracks(withMediaType: .audio)
@@ -331,7 +352,7 @@ final class PlaybackController: ObservableObject {
     if let lut, !clip.isAudio {
       let ciContext = context
       item.videoComposition = try await AVVideoComposition.videoComposition(
-        with: asset,
+        with: playbackAsset,
         applyingCIFiltersWithHandler: { request in
           let source = request.sourceImage
           request.finish(with: lut.apply(to: source).cropped(to: source.extent), context: ciContext)
@@ -342,6 +363,15 @@ final class PlaybackController: ObservableObject {
     clearObservers()
     usingProxy = isProxy
     player.replaceCurrentItem(with: item)
+    // AVPlayer's presentation geometry includes embedded orientation, the correction,
+    // composition rendering, and the actual proxy/original selected for playback.
+    presentationObservation = item.observe(\.presentationSize, options: [.initial, .new]) {
+      [weak self] item, _ in
+      Task { @MainActor [weak self] in
+        guard let self, token == self.generation, self.player.currentItem === item else { return }
+        self.presentationSize = item.presentationSize
+      }
+    }
     observation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
       Task { @MainActor [weak self] in
         guard let self, token == self.generation, self.player.currentItem === item else { return }
@@ -350,6 +380,7 @@ final class PlaybackController: ObservableObject {
             item, clip: clip, lut: lut, isProxy: isProxy,
             initialPosition: position, resume: resume, token: token)
         } else if item.status == .readyToPlay {
+          self.presentationSize = item.presentationSize
           self.loading = false
         }
       }
@@ -401,5 +432,54 @@ final class PlaybackController: ObservableObject {
         loading = false
       }
     }
+  }
+}
+
+/// Compositions reference source samples; they never export or modify media.
+enum VideoOrientation {
+  // Exact quarter turns avoid one-pixel cropping from trigonometric round-off.
+  private static func clockwiseTransform(_ rotation: VideoRotation) -> CGAffineTransform {
+    switch rotation {
+    case .clockwise90: return CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 0, ty: 0)
+    case .halfTurn: return CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: 0, ty: 0)
+    case .counterclockwise90: return CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: 0)
+    }
+  }
+
+  static func transform(size: CGSize, preferred: CGAffineTransform, rotation: VideoRotation)
+    -> CGAffineTransform
+  {
+    let rotated = preferred.concatenating(clockwiseTransform(rotation))
+    let bounds = CGRect(origin: .zero, size: size).applying(rotated)
+    return rotated.concatenating(CGAffineTransform(translationX: -bounds.minX, y: -bounds.minY))
+  }
+
+  static func image(_ source: CIImage, rotation: VideoRotation) -> CIImage {
+    // Core Image uses a bottom-left origin; clockwise corrections have negative angles.
+    let rotated = source.transformed(by: clockwiseTransform(rotation).inverted())
+    return rotated.transformed(
+      by: CGAffineTransform(
+        translationX: -rotated.extent.minX, y: -rotated.extent.minY))
+  }
+
+  static func asset(_ source: AVAsset, rotation: VideoRotation) async throws -> AVAsset {
+    let composition = AVMutableComposition()
+    for type in [AVMediaType.video, .audio] {
+      for track in try await source.loadTracks(withMediaType: type) {
+        guard
+          let destination = composition.addMutableTrack(
+            withMediaType: type, preferredTrackID: kCMPersistentTrackID_Invalid)
+        else { continue }
+        let range = try await track.load(.timeRange)
+        try destination.insertTimeRange(range, of: track, at: range.start)
+        if type == .video {
+          let size = try await track.load(.naturalSize)
+          let preferred = try await track.load(.preferredTransform)
+          destination.preferredTransform = transform(
+            size: size, preferred: preferred, rotation: rotation)
+        }
+      }
+    }
+    return composition
   }
 }

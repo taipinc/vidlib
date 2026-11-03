@@ -7,6 +7,8 @@ struct LibraryView: View {
   @State private var showCollectionSheet = false
   @State private var collectionName = ""
   @State private var showCache = false
+  @State private var newProject: ProjectDraft?
+  @State private var showResolveSheet = false
   private let columns = [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 16)]
 
   var body: some View {
@@ -36,6 +38,24 @@ struct LibraryView: View {
               .contentShape(Rectangle())
             }
             .buttonStyle(.plain).foregroundStyle(.secondary)
+          }
+          VStack(alignment: .leading, spacing: 4) {
+            SidebarHeading("Projects")
+            ForEach(library.catalog.editingProjects) { project in
+              CollectionDropTarget(
+                name: project.name, count: project.clipIDs.count,
+                selected: library.selection == .project(project.id),
+                select: { library.selection = .project(project.id) },
+                accepts: { !$0.isDisjoint(with: library.catalog.clips.map(\.id)) },
+                drop: { library.addClips($0, toProject: project.id) }
+              ).frame(maxWidth: .infinity).frame(height: 27)
+            }
+            Button {
+              newProject = ProjectDraft(ids: [])
+            } label: {
+              Label("New Project", systemImage: "plus")
+                .padding(.horizontal, 8).frame(height: 27)
+            }.buttonStyle(.plain).foregroundStyle(.secondary)
           }
           VStack(alignment: .leading, spacing: 4) {
             SidebarHeading("Folders")
@@ -94,6 +114,12 @@ struct LibraryView: View {
               .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
+            if case .project(let id) = library.selection,
+              let project = library.catalog.editingProjects.first(where: { $0.id == id })
+            {
+              Button("Send to Resolve…") { showResolveSheet = true }
+                .disabled(project.clipIDs.isEmpty)
+            }
             Menu {
               Button("Recording date · newest first") { library.sortByDate = true }
               Button("Filename · A–Z") { library.sortByDate = false }
@@ -116,7 +142,7 @@ struct LibraryView: View {
             ContentUnavailableView(
               "No media here", systemImage: "magnifyingglass",
               description: Text(
-                "Try a different search, or add files to this collection from All Media.")
+                "Try a different search, or add files here from All Media.")
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
           } else {
@@ -148,6 +174,14 @@ struct LibraryView: View {
                       Button("Show in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([clip.url])
                       }
+                      ProjectMembershipMenu(
+                        ids: library.selectedIDs.contains(clip.id)
+                          ? library.selectedIDs : [clip.id],
+                        createProject: {
+                          newProject = ProjectDraft(
+                            ids: library.selectedIDs.contains(clip.id)
+                              ? library.selectedIDs : [clip.id])
+                        })
                       Menu("Add to Collection") {
                         ForEach(library.catalog.collections) { collection in
                           Button(collection.name) {
@@ -186,6 +220,14 @@ struct LibraryView: View {
             .disabled(collectionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
       }.padding(24).frame(width: 360)
+    }
+    .sheet(item: $newProject) { draft in NewEditingProjectView(clipIDs: draft.ids) }
+    .sheet(isPresented: $showResolveSheet) {
+      if case .project(let id) = library.selection,
+        let project = library.catalog.editingProjects.first(where: { $0.id == id })
+      {
+        ResolveSendView(project: project, selectedIDs: library.selectedIDs)
+      }
     }
     .sheet(isPresented: $showCache) {
       VStack(alignment: .trailing) {
@@ -339,7 +381,10 @@ struct ClipCard: View {
     )
     .contentShape(Rectangle())
     .help(clip.url.path)
-    .task(id: "\(clip.id)-\(clip.lutID?.uuidString ?? "none")-\(library.cacheGeneration)") {
+    .task(
+      id:
+        "\(clip.id)-\(clip.lutID?.uuidString ?? "none")-\(clip.rotation?.rawValue ?? 0)-\(library.cacheGeneration)"
+    ) {
       finished = false
       let data = await library.thumbnails.thumbnail(
         clip: clip, lut: library.lut(for: clip), lutID: clip.lutID)
@@ -518,6 +563,10 @@ struct ViewerPane: View {
                       Button(collection.name) { library.addSelected(to: collection.id) }
                     }
                   }.disabled(library.catalog.collections.isEmpty)
+                  ProjectMembershipMenu(ids: library.selectedIDs)
+                  if case .project = library.selection {
+                    Button("Remove from This Project", action: library.removeSelectedFromProject)
+                  }
                   if case .collection(let id) = library.selection,
                     let collection = library.catalog.collections.first(where: { $0.id == id }),
                     !collection.clipIDs.isDisjoint(with: library.selectedIDs)
@@ -531,6 +580,7 @@ struct ViewerPane: View {
                   Text("File Details").font(.headline)
                   LabeledContent("Filename", value: clip.name)
                   if !clip.isAudio {
+                    if library.selectedIDs.count == 1 { VideoRotationPicker(clip: clip) }
                     LabeledContent(
                       "Resolution",
                       value: clip.width > 0 ? "\(clip.width) × \(clip.height)" : "Unknown")
@@ -574,7 +624,10 @@ struct ViewerPane: View {
     gainDB = library.selectedClip?.playbackGainDB ?? 0
   }
   private func aspectRatio(_ clip: Clip) -> CGFloat {
-    clip.width > 0 && clip.height > 0 ? CGFloat(clip.width) / CGFloat(clip.height) : 16 / 9
+    if !clip.isAudio, let ratio = controller.presentationAspectRatio { return ratio }
+    guard clip.width > 0 && clip.height > 0 else { return 16 / 9 }
+    let ratio = CGFloat(clip.width) / CGFloat(clip.height)
+    return clip.rotation?.swapsDimensions == true ? 1 / ratio : ratio
   }
 }
 
@@ -628,7 +681,7 @@ struct CacheSettingsView: View {
           Button("Clear Thumbnails", action: library.clearCache)
         }
         Text(
-          "Only generated thumbnails are cached in this version. Oldest used thumbnails are removed when the limit is reached. Changing location leaves the old cache in place. Tags, collections, and LUTs are stored separately and are never evicted."
+          "Only generated thumbnails are cached in this version. Oldest used thumbnails are removed when the limit is reached. Changing location leaves the old cache in place. Tags, collections, projects, and LUTs are stored separately and are never evicted."
         )
         .font(.caption).foregroundStyle(.secondary)
       }
@@ -672,6 +725,29 @@ private struct LibraryInteractionMonitor: NSViewRepresentable {
     func stop() {
       if let monitor { NSEvent.removeMonitor(monitor) }
       monitor = nil
+    }
+  }
+}
+
+private struct VideoRotationPicker: View {
+  @EnvironmentObject private var library: LibraryModel
+  let clip: Clip
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Picker(
+        "Rotation",
+        selection: Binding<Int>(
+          get: { clip.rotation?.rawValue ?? 0 },
+          set: { library.setRotation(VideoRotation(rawValue: $0)) }
+        )
+      ) {
+        Text("Use File Orientation").tag(0)
+        ForEach(VideoRotation.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+      }
+      Text(
+        "Rotation correction from the file’s orientation. Saved in Vidlib; applies to preview and thumbnails."
+      )
+      .font(.caption).foregroundStyle(.secondary)
     }
   }
 }

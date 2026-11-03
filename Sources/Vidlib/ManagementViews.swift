@@ -18,7 +18,7 @@ private struct LibrarySettingsView: View {
         LabeledContent("LUTs") { Button("Manage LUTs…") { showLUTs = true } }
         LabeledContent("Source folders") { Button("Manage Folders…") { showFolders = true } }
         Text(
-          "Source folders are checked manually with Refresh. Removing a folder removes its catalog entries and collection memberships; original files stay in place."
+          "Source folders are checked manually with Refresh. Removing a folder removes its catalog entries and collection/project memberships; original files stay in place."
         )
         .font(.caption).foregroundStyle(.secondary)
       }
@@ -88,7 +88,7 @@ struct FolderManagementView: View {
         }
       } message: { root in
         Text(
-          "Remove “\(root.url.lastPathComponent)” and its \(count(for: root)) entries, including their saved edits and collection memberships? This folder will no longer be included in Refresh. Original files stay untouched."
+          "Remove “\(root.url.lastPathComponent)” and its \(count(for: root)) entries, including their saved edits and collection/project memberships? This folder will no longer be included in Refresh. Original files stay untouched."
         )
       }
   }
